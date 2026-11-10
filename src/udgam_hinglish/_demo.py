@@ -22,6 +22,8 @@ from ._vendor.top import inspect_top, parse_top, to_json_tree, walk_nodes
 
 MAX_BODY_BYTES = 16384
 MAX_TEXT_CHARS = 2000
+MAX_CONCURRENT_CONNECTIONS = 16
+CONNECTION_DEADLINE_SECONDS = 30
 LIMITATION = (
     "Experimental preview for alarm, event, messaging, music, navigation, reminder, "
     "timer and weather commands in Romanized Hinglish or English. Other requests "
@@ -255,10 +257,31 @@ class LocalServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, app, port):
         self.app = app
+        self._connection_slots = threading.Semaphore(MAX_CONCURRENT_CONNECTIONS)
         super().__init__(("127.0.0.1", port), LocalHandler)
         actual_port = self.server_address[1]
         self.allowed_hosts = {f"127.0.0.1:{actual_port}", f"localhost:{actual_port}"}
         self.allowed_origins = {f"http://{host}" for host in self.allowed_hosts}
+
+    def process_request(self, request, client_address):
+        # A trickling client can hold a handler thread open past the per-read
+        # timeout in LocalHandler.setup (it only bounds a single read, not the
+        # connection's lifetime). Cap concurrent handler threads instead of
+        # letting unbounded accepted connections each get one.
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
 
 
 class LocalHandler(http.server.BaseHTTPRequestHandler):
@@ -268,6 +291,23 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(10)
+        # The timeout above resets on every individual read, so a client that
+        # trickles a byte every few seconds never trips it. Force the socket
+        # closed once the connection has been open too long regardless of
+        # per-read activity, so a stalled handler thread cannot be held forever.
+        self._deadline_timer = threading.Timer(CONNECTION_DEADLINE_SECONDS, self._force_close)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _force_close(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        self._deadline_timer.cancel()
+        super().finish()
 
     def log_message(self, format, *args):
         # Access paths or exception strings can contain private command text.
@@ -309,6 +349,9 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             raise RequestError("Cross-site requests are not accepted.", status=403, code="origin_rejected")
 
     def do_GET(self):
+        # No further socket reads happen below; the deadline only needs to
+        # cover the request-line/header read that already finished.
+        self._deadline_timer.cancel()
         try:
             self.check_surface()
             if self.path == "/":
@@ -340,6 +383,10 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise RequestError("Use application/json.", status=415, code="content_type")
             raw = self.rfile.read(length)
+            # The body read above is the last socket read for this request;
+            # local inference afterwards can legitimately take longer than the
+            # read deadline, so stop it instead of letting it fire mid-generation.
+            self._deadline_timer.cancel()
             if len(raw) != length:
                 raise RequestError("Incomplete request body.")
             try:
@@ -353,5 +400,6 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             self.reject("The local request body timed out.", 408, "timeout")
 
     def do_OPTIONS(self):
+        self._deadline_timer.cancel()
         self.reject("Cross-origin access is not enabled.", 405, "method_not_allowed")
 
