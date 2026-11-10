@@ -182,6 +182,7 @@ def validate_model_card(directory, adapter, fingerprint, adapter_config, train_h
     need(evidence.get("status") == "private_model_card_draft" and evidence.get("publication_authorized") is False, "only private assembler evidence is accepted")
     need((evidence.get("model_id"), evidence.get("base_revision"), evidence.get("candidate_adapter_sha256")) == (BASE_MODEL, BASE_REVISION, fingerprint), "base revision or selected adapter differs")
     assembler_path = Path(__file__).resolve().with_name("assemble_model_card.py")
+    need(assembler_path.is_file(), "private assemble_model_card.py is not present in this checkout; --model-card-dir is unsupported here")
     need(evidence.get("assembler_sha256") == sha256_file(assembler_path), "assembler version differs; assemble a fresh private draft")
     spec = importlib.util.spec_from_file_location("udgam_card_attachment_renderer", assembler_path)
     assembler = importlib.util.module_from_spec(spec)
