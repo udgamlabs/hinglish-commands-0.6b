@@ -43,7 +43,7 @@ For an explicitly requested download, use the published release's full commit:
 ```bash
 udgam-hinglish parse \
   --repo-id UdgamLabs/hinglish-commands-0.6b \
-  --revision 4b45809cc31814a2dd4f39f388e4b74a428e4ca2 \
+  --revision 77d3ce7072b7b33b331169ac7a6bb50d4c89d8ae \
   --allow-base-download \
   --text "kal subah 7 baje alarm lagao"
 ```
